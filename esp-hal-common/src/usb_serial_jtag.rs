@@ -1,3 +1,5 @@
+use core::convert::Infallible;
+
 use crate::pac::{usb_device::RegisterBlock, USB_DEVICE};
 
 pub struct UsbSerialJtag<T> {
@@ -5,8 +7,7 @@ pub struct UsbSerialJtag<T> {
 }
 
 /// Custom USB serial error type
-#[derive(Debug)]
-pub enum Error {}
+type Error = Infallible;
 
 impl<T> UsbSerialJtag<T>
 where
@@ -26,11 +27,11 @@ where
         self.usb_serial
     }
 
+    /// Write data to the serial output in chunks of up to 64 bytes
     pub fn write_bytes(&mut self, data: &[u8]) -> Result<(), Error> {
         let reg_block = self.usb_serial.register_block();
 
-        // TODO: 64 byte chunks max
-        for chunk in data.chunks(32) {
+        for chunk in data.chunks(64) {
             unsafe {
                 for &b in chunk {
                     reg_block.ep1.write(|w| w.rdwr_byte().bits(b.into()))
@@ -44,6 +45,52 @@ where
         }
 
         Ok(())
+    }
+
+    /// Write data to the serial output in a non-blocking manner
+    /// Requires manual flushing (automatically flushed every 64 bytes)
+    pub fn write_byte_nb(&mut self, word: u8) -> nb::Result<(), Error> {
+        let reg_block = self.usb_serial.register_block();
+
+        if reg_block
+            .ep1_conf
+            .read()
+            .serial_in_ep_data_free()
+            .bit_is_set()
+        {
+            // the FIFO is not full
+
+            unsafe {
+                reg_block.ep1.write(|w| w.rdwr_byte().bits(word.into()));
+            }
+            Ok(())
+        } else {
+            Err(nb::Error::WouldBlock)
+        }
+    }
+
+    /// Flush the output FIFO and block until it has been sent
+    pub fn flush_tx(&mut self) -> Result<(), Error> {
+        let reg_block = self.usb_serial.register_block();
+        reg_block.ep1_conf.write(|w| w.wr_done().set_bit());
+
+        while reg_block.ep1_conf.read().bits() & 0b011 == 0b000 {
+            // wait
+        }
+
+        Ok(())
+    }
+
+    /// Flush the output FIFO but don't block if it isn't ready immediately
+    pub fn flush_tx_nb(&mut self) -> nb::Result<(), Error> {
+        let reg_block = self.usb_serial.register_block();
+        reg_block.ep1_conf.write(|w| w.wr_done().set_bit());
+
+        if reg_block.ep1_conf.read().bits() & 0b011 == 0b000 {
+            Err(nb::Error::WouldBlock)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn read_byte(&mut self) -> nb::Result<u8, Error> {
@@ -163,5 +210,20 @@ where
 
     fn read(&mut self) -> nb::Result<u8, Self::Error> {
         self.read_byte()
+    }
+}
+
+impl<T> embedded_hal::serial::Write<u8> for UsbSerialJtag<T>
+where
+    T: Instance,
+{
+    type Error = Error;
+
+    fn write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
+        self.write_byte_nb(word)
+    }
+
+    fn flush(&mut self) -> nb::Result<(), Self::Error> {
+        self.flush_tx_nb()
     }
 }
